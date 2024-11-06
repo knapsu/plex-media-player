@@ -11,6 +11,8 @@
 #include <QtQuick/QQuickWindow>
 #include <QOpenGLFunctions>
 
+#include <mpv/render_gl.h>
+
 #include "QsLog.h"
 #include "utils/Utils.h"
 
@@ -23,12 +25,6 @@
 
 #ifdef USE_X11EXTRAS
 #include <QX11Info>
-static void* MPGetNativeDisplay(const char* name)
-{
-  if (strcmp(name, "x11") == 0)
-    return QX11Info::display();
-  return nullptr;
-}
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -41,14 +37,6 @@ static void* get_proc_address(void* ctx, const char* name)
     return nullptr;
 
   void *res = (void *)glctx->getProcAddress(QByteArray(name));
-  if (strcmp(name, "glMPGetNativeDisplay") == 0)
-  {
-#ifdef USE_X11EXTRAS
-    return (void *)&MPGetNativeDisplay;
-#else
-    return nullptr;
-#endif
-  }
 #ifdef Q_OS_WIN32
   // wglGetProcAddress(), which is used by Qt, does not always resolve all
   // builtin functions with all drivers (only extensions). Qt compensates this
@@ -93,7 +81,6 @@ private:
 PlayerRenderer::PlayerRenderer(mpv::qt::Handle mpv, QQuickWindow* window)
 : m_mpv(mpv), m_mpvGL(nullptr), m_window(window), m_size(), m_hAvrtHandle(nullptr), m_videoRectangle(-1, -1, -1, -1), m_fbo(0)
 {
-  m_mpvGL = (mpv_opengl_cb_context *)mpv_get_sub_api(m_mpv, MPV_SUB_API_OPENGL_CB);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -104,11 +91,26 @@ bool PlayerRenderer::init()
   DwmEnableMMCSS(TRUE);
 #endif
 
-  mpv_opengl_cb_set_update_callback(m_mpvGL, on_update, (void *)this);
+  mpv_opengl_init_params opengl_params = {
+      .get_proc_address = get_proc_address,
+      .get_proc_address_ctx = NULL,
+  };
 
-  // Signals presence of MPGetNativeDisplay().
-  const char *extensions = "GL_MP_MPGetNativeDisplay";
-  return mpv_opengl_cb_init_gl(m_mpvGL, extensions, get_proc_address, nullptr) >= 0;
+  mpv_render_param params[] = {
+    {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+    {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &opengl_params},
+#ifdef USE_X11EXTRAS
+    {MPV_RENDER_PARAM_X11_DISPLAY, QX11Info::display()},
+#endif
+    {MPV_RENDER_PARAM_INVALID},
+  };
+  int err = mpv_render_context_create(&m_mpvGL, m_mpv, params);
+
+  if (err >= 0) {
+    mpv_render_context_set_update_callback(m_mpvGL, on_update, (void *)this);
+    return true;
+  }
+  return false;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -116,7 +118,8 @@ PlayerRenderer::~PlayerRenderer()
 {
   // Keep in mind that the m_mpv handle must be held until this is done.
   if (m_mpvGL)
-    mpv_opengl_cb_uninit_gl(m_mpvGL);
+    mpv_render_context_free(m_mpvGL);
+  m_mpvGL = nullptr;
   delete m_fbo;
 }
 
@@ -158,9 +161,18 @@ void PlayerRenderer::render()
     }
   }
 
-  // The negative height signals to mpv that the video should be flipped
-  // (according to the flipped OpenGL coordinate system).
-  mpv_opengl_cb_draw(m_mpvGL, fbo, fboSize.width(), (flip ? -1 : 1) * fboSize.height());
+  mpv_opengl_fbo mpv_fbo = {
+    .fbo = fbo,
+    .w = fboSize.width(),
+    .h = fboSize.height(),
+  };
+  int mpv_flip = flip ? -1 : 0;
+  mpv_render_param params[] = {
+    {MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
+    {MPV_RENDER_PARAM_FLIP_Y, &mpv_flip},
+    {MPV_RENDER_PARAM_INVALID}
+  };
+  mpv_render_context_render(m_mpvGL, params);
 
   m_window->resetOpenGLState();
 
@@ -177,7 +189,8 @@ void PlayerRenderer::render()
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 void PlayerRenderer::swap()
 {
-  mpv_opengl_cb_report_flip(m_mpvGL, 0);
+  if (m_mpvGL)
+    mpv_render_context_report_swap(m_mpvGL);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -224,7 +237,7 @@ PlayerQuickItem::PlayerQuickItem(QQuickItem* parent)
 PlayerQuickItem::~PlayerQuickItem()
 {
   if (m_mpvGL)
-    mpv_opengl_cb_set_update_callback(m_mpvGL, nullptr, nullptr);
+    mpv_render_context_set_update_callback(m_mpvGL, nullptr, nullptr);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -297,10 +310,6 @@ void PlayerQuickItem::onInvalidate()
 void PlayerQuickItem::initMpv(PlayerComponent* player)
 {
   m_mpv = player->getMpvHandle();
-
-  m_mpvGL = (mpv_opengl_cb_context *)mpv_get_sub_api(m_mpv, MPV_SUB_API_OPENGL_CB);
-  if (!m_mpvGL)
-    throw FatalException(tr("OpenGL not enabled in libmpv."));
 
   connect(player, &PlayerComponent::windowVisible, this, &QQuickItem::setVisible);
   window()->update();

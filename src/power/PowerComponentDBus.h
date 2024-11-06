@@ -23,13 +23,19 @@ class PowerComponentDBus : public PowerComponent
     return flags;
   }
 
-    virtual bool PowerOff() { return callPowerMethod("PowerOff"); }
-    virtual bool Reboot() { return callPowerMethod("Reboot"); }
+    virtual bool PowerOff();
+    virtual bool Reboot();
     virtual bool Suspend() { return callPowerMethod("Suspend"); }
 
   private:
     bool callPowerMethod(QString method);
     bool isPowerMethodAvailable(QString method);
+
+    unsigned int screensaver_inhibit_cookie = 0;
+  
+  protected:
+    virtual void doDisableScreensaver();
+    virtual void doEnableScreensaver();
 };
 
 #endif // POWERCOMPONENTDBUS_H
